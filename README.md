@@ -96,6 +96,8 @@ Windows 图标源文件为 `assets/yike-export-time.ico`。编译示例：
 
 ## 界面截图
 
+![YikeExportTime 导出页](assets/screenshots/export-empty.png)
+
 仓库截图只应使用无 URL、Cookie、本地用户名、目录路径和个人照片的干净界面。截图命名、推荐画面与界面改进建议见 [界面与截图规范](docs/INTERFACE.md)。
 
 ## 搜索关键词
