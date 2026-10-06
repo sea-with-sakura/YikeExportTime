@@ -531,7 +531,7 @@ namespace YikeExporter
         private string lastDirectory;
         public MainForm()
         {
-            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.2";
+            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.3";
             Size = new Size(900, 810);
             MinimumSize = new Size(900, 760);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1033,10 +1033,92 @@ namespace YikeExporter
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
         }
+        private static uint BigEndianUInt32(byte[] value, int offset)
+        {
+            if (offset < 0 || offset + 4 > value.Length) return 0;
+            return ((uint)value[offset] << 24) | ((uint)value[offset + 1] << 16) | ((uint)value[offset + 2] << 8) | value[offset + 3];
+        }
+        private static uint LittleEndianUInt32(byte[] value, int offset)
+        {
+            if (offset < 0 || offset + 4 > value.Length) return 0;
+            return (uint)(value[offset] | (value[offset + 1] << 8) | (value[offset + 2] << 16) | (value[offset + 3] << 24));
+        }
+        private static bool TryReadPngDate(string path, out DateTimeOffset? date)
+        {
+            date = null;
+            try
+            {
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    byte[] signature = new byte[8];
+                    if (!ReadFully(file, signature) || signature[0] != 137 || Encoding.ASCII.GetString(signature, 1, 3) != "PNG") return false;
+                    byte[] header = new byte[8];
+                    while (file.Position + 12 <= file.Length)
+                    {
+                        if (!ReadFully(file, header)) return false;
+                        uint length = BigEndianUInt32(header, 0);
+                        string type = Encoding.ASCII.GetString(header, 4, 4);
+                        if (length > file.Length - file.Position - 4) return false;
+                        if ((type == "eXIf" || type == "iTXt" || type == "tEXt") && length <= 2097152)
+                        {
+                            byte[] data = new byte[(int)length];
+                            if (!ReadFully(file, data)) return false;
+                            DateTimeOffset? candidate = type == "eXIf" ? TiffDate(data, 0) : XmpDate(data);
+                            if (candidate.HasValue && (!date.HasValue || candidate.Value < date.Value)) date = candidate;
+                        }
+                        else file.Position += length;
+                        file.Position += 4;
+                        if (type == "IEND") return true;
+                    }
+                    return true;
+                }
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+        private static bool TryReadWebpDate(string path, out DateTimeOffset? date)
+        {
+            date = null;
+            try
+            {
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    byte[] signature = new byte[12];
+                    if (!ReadFully(file, signature) || Encoding.ASCII.GetString(signature, 0, 4) != "RIFF" || Encoding.ASCII.GetString(signature, 8, 4) != "WEBP") return false;
+                    byte[] header = new byte[8];
+                    while (file.Position + 8 <= file.Length)
+                    {
+                        if (!ReadFully(file, header)) return false;
+                        string type = Encoding.ASCII.GetString(header, 0, 4);
+                        uint length = LittleEndianUInt32(header, 4);
+                        if (length > file.Length - file.Position) return false;
+                        if ((type == "EXIF" || type == "XMP ") && length <= 2097152)
+                        {
+                            byte[] data = new byte[(int)length];
+                            if (!ReadFully(file, data)) return false;
+                            DateTimeOffset? candidate = type == "EXIF" ? TiffDate(data, 0) : XmpDate(data);
+                            if (candidate.HasValue && (!date.HasValue || candidate.Value < date.Value)) date = candidate;
+                        }
+                        else file.Position += length;
+                        if ((length & 1) == 1) file.Position++;
+                    }
+                    return true;
+                }
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
         private static bool TryReadFastDate(LocalFile file, out DateTimeOffset? date)
         {
             string extension = Path.GetExtension(file.Path);
-            if (extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)) return TryReadJpegDate(file.Path, out date);
+            if (extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryReadJpegDate(file.Path, out date)) return true;
+                if (TryReadPngDate(file.Path, out date)) return true;
+                return TryReadWebpDate(file.Path, out date);
+            }
+            if (extension.Equals(".png", StringComparison.OrdinalIgnoreCase)) return TryReadPngDate(file.Path, out date);
+            if (extension.Equals(".webp", StringComparison.OrdinalIgnoreCase)) return TryReadWebpDate(file.Path, out date);
             if (extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase) || extension.Equals(".mov", StringComparison.OrdinalIgnoreCase) || extension.Equals(".m4v", StringComparison.OrdinalIgnoreCase) || extension.Equals(".3gp", StringComparison.OrdinalIgnoreCase)) return QuickTimeDatePatcher.TryReadCreatedDate(file.Path, out date);
             if (extension.Equals(".tif", StringComparison.OrdinalIgnoreCase) || extension.Equals(".tiff", StringComparison.OrdinalIgnoreCase) || extension.Equals(".dng", StringComparison.OrdinalIgnoreCase) || extension.Equals(".cr2", StringComparison.OrdinalIgnoreCase) || extension.Equals(".nef", StringComparison.OrdinalIgnoreCase) || extension.Equals(".arw", StringComparison.OrdinalIgnoreCase) || extension.Equals(".raf", StringComparison.OrdinalIgnoreCase) || extension.Equals(".rw2", StringComparison.OrdinalIgnoreCase)) return TryReadTiffDate(file.Path, out date);
             date = null;
@@ -1087,7 +1169,6 @@ namespace YikeExporter
             Dictionary<string, DateTimeOffset?> dates = new Dictionary<string, DateTimeOffset?>(StringComparer.OrdinalIgnoreCase);
             List<LocalFile> compatibilityFiles = new List<LocalFile>();
             int fastFiles = 0;
-            const int batchSize = 100;
             log("正在快速读取已有日期：0/" + targets.Count + "。 ");
             for (int i = 0; i < targets.Count; i++)
             {
@@ -1097,41 +1178,8 @@ namespace YikeExporter
                 else compatibilityFiles.Add(file);
                 if ((i + 1) % 100 == 0 || i + 1 == targets.Count) log("正在快速读取已有日期：" + (i + 1) + "/" + targets.Count + "。 ");
             }
-            if (compatibilityFiles.Count == 0)
-            {
-                log("已有日期读取完成：快速读取 " + fastFiles + " 个文件。 ");
-                return dates;
-            }
-            log("正在兼容读取 " + compatibilityFiles.Count + " 个其它格式文件的日期：0/" + compatibilityFiles.Count + "。 ");
-            for (int offset = 0; offset < compatibilityFiles.Count; offset += batchSize)
-            {
-                List<LocalFile> batch = compatibilityFiles.Skip(offset).Take(batchSize).ToList();
-                ProcessStartInfo start = new ProcessStartInfo {
-                    FileName = exifTool,
-                    Arguments = "-j -G1 -s -api QuickTimeUTC=1 -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -QuickTime:CreationDate " + String.Join(" ", batch.Select(file => Quote(file.Path))),
-                    UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
-                };
-                using (Process process = Process.Start(start))
-                {
-                    string output = process.StandardOutput.ReadToEnd();
-                    string error = process.StandardError.ReadToEnd();
-                    process.WaitForExit();
-                    if (process.ExitCode != 0 && String.IsNullOrWhiteSpace(output)) throw new ExportException("无法读取文件内日期：" + error.Trim());
-                    ArrayList rows;
-                    try { rows = Json.Serializer().Deserialize<ArrayList>(output); }
-                    catch { throw new ExportException("读取文件日期时返回了异常内容。 "); }
-                    foreach (object row in rows)
-                    {
-                        Dictionary<string, object> tags = Json.Object(row);
-                        string source = Json.Text(Json.Get(tags, "SourceFile"));
-                        if (!String.IsNullOrWhiteSpace(source)) dates[NormalizePath(source)] = ExistingDate(tags);
-                    }
-                }
-                int completed = Math.Min(offset + batch.Count, compatibilityFiles.Count);
-                log("正在兼容读取其它格式文件的日期：" + completed + "/" + compatibilityFiles.Count + "。 ");
-            }
-            foreach (LocalFile file in compatibilityFiles) if (!dates.ContainsKey(NormalizePath(file.Path))) dates[NormalizePath(file.Path)] = null;
-            log("已有日期读取完成：快速读取 " + fastFiles + " 个文件，兼容读取 " + compatibilityFiles.Count + " 个文件。 ");
+            if (compatibilityFiles.Count > 0) log("有 " + compatibilityFiles.Count + " 个文件无法快速确认已有日期；为避免覆盖风险，这些文件将跳过，不写入。 ");
+            log("已有日期读取完成：快速读取 " + fastFiles + " 个文件。 ");
             return dates;
         }
         private static string Csv(string text)
@@ -1190,7 +1238,8 @@ namespace YikeExporter
             {
                 DateTimeOffset? album = ParseDate(item.Cloud.album_time_china);
                 DateTimeOffset? existing;
-                if (metadata.TryGetValue(NormalizePath(item.Local.Path), out existing)) item.ExistingDate = existing;
+                if (!metadata.TryGetValue(NormalizePath(item.Local.Path), out existing)) { plan.Unsupported++; continue; }
+                item.ExistingDate = existing;
                 if (item.ExistingDate.HasValue) { plan.ExistingDateSkipped++; continue; }
                 item.AlbumDate = album.Value;
                 item.TargetDate = item.AlbumDate;
@@ -1311,7 +1360,7 @@ namespace YikeExporter
             try
             {
                 DatePlan plan = await Task.Run(() => DateWriteEngine.Build(json, media, ExifToolPath, AddLog));
-                AddLog("匹配完成：文件名 " + plan.NameMatches + "，MD5 " + plan.Md5Matches + "（校验 " + plan.Md5FilesChecked + " 个重名文件），已有日期跳过 " + plan.ExistingDateSkipped + "，未匹配 " + plan.Unmatched + "，歧义 " + plan.Ambiguous + "。 ");
+                AddLog("匹配完成：文件名 " + plan.NameMatches + "，MD5 " + plan.Md5Matches + "（校验 " + plan.Md5FilesChecked + " 个重名文件），已有日期跳过 " + plan.ExistingDateSkipped + "，无法确认日期跳过 " + plan.Unsupported + "，未匹配 " + plan.Unmatched + "，歧义 " + plan.Ambiguous + "。 ");
                 if (plan.Items.Count == 0) { AddLog("没有可处理的文件。 "); return; }
                 AddLog("开始写入 " + plan.Items.Count + " 个文件的日期元数据。 ");
                 int count = await Task.Run(() => DateWriteEngine.Write(plan, ExifToolPath, AddLog));
