@@ -531,7 +531,7 @@ namespace YikeExporter
         private string lastDirectory;
         public MainForm()
         {
-            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.0";
+            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.1";
             Size = new Size(900, 810);
             MinimumSize = new Size(900, 760);
             StartPosition = FormStartPosition.CenterScreen;
@@ -871,32 +871,40 @@ namespace YikeExporter
             catch (UnauthorizedAccessException) { throw new ExportException("没有权限读取所选目录。请改选可访问的媒体目录。 "); }
             return files;
         }
-        private static Dictionary<string, Dictionary<string, object>> ReadExistingDates(string exifTool, string root, Action<string> log)
+        private static Dictionary<string, Dictionary<string, object>> ReadExistingDates(string exifTool, IEnumerable<LocalFile> files, Action<string> log)
         {
-            log("正在读取文件内已有的日期……");
-            ProcessStartInfo start = new ProcessStartInfo {
-                FileName = exifTool,
-                Arguments = "-j -G1 -s -api QuickTimeUTC=1 -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -QuickTime:CreationDate -r " + Quote(root),
-                UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
-            };
-            using (Process process = Process.Start(start))
+            List<LocalFile> targets = files.ToList();
+            Dictionary<string, Dictionary<string, object>> dates = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+            const int batchSize = 100;
+            log("正在读取已匹配文件的内嵌日期：0/" + targets.Count + "。 ");
+            for (int offset = 0; offset < targets.Count; offset += batchSize)
             {
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
-                process.WaitForExit();
-                if (process.ExitCode != 0 && String.IsNullOrWhiteSpace(output)) throw new ExportException("无法读取文件内日期：" + error.Trim());
-                ArrayList rows;
-                try { rows = Json.Serializer().Deserialize<ArrayList>(output); }
-                catch { throw new ExportException("读取文件日期时返回了异常内容。 "); }
-                Dictionary<string, Dictionary<string, object>> dates = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
-                foreach (object row in rows)
+                List<LocalFile> batch = targets.Skip(offset).Take(batchSize).ToList();
+                ProcessStartInfo start = new ProcessStartInfo {
+                    FileName = exifTool,
+                    Arguments = "-j -G1 -s -api QuickTimeUTC=1 -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -QuickTime:CreationDate " + String.Join(" ", batch.Select(file => Quote(file.Path))),
+                    UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
+                };
+                using (Process process = Process.Start(start))
                 {
-                    Dictionary<string, object> tags = Json.Object(row);
-                    string source = Json.Text(Json.Get(tags, "SourceFile"));
-                    if (!String.IsNullOrWhiteSpace(source)) dates[NormalizePath(source)] = tags;
+                    string output = process.StandardOutput.ReadToEnd();
+                    string error = process.StandardError.ReadToEnd();
+                    process.WaitForExit();
+                    if (process.ExitCode != 0 && String.IsNullOrWhiteSpace(output)) throw new ExportException("无法读取文件内日期：" + error.Trim());
+                    ArrayList rows;
+                    try { rows = Json.Serializer().Deserialize<ArrayList>(output); }
+                    catch { throw new ExportException("读取文件日期时返回了异常内容。 "); }
+                    foreach (object row in rows)
+                    {
+                        Dictionary<string, object> tags = Json.Object(row);
+                        string source = Json.Text(Json.Get(tags, "SourceFile"));
+                        if (!String.IsNullOrWhiteSpace(source)) dates[NormalizePath(source)] = tags;
+                    }
                 }
-                return dates;
+                int completed = Math.Min(offset + batch.Count, targets.Count);
+                log("正在读取已匹配文件的内嵌日期：" + completed + "/" + targets.Count + "。 ");
             }
+            return dates;
         }
         private static string Csv(string text)
         {
@@ -906,7 +914,7 @@ namespace YikeExporter
         public static DatePlan Build(string jsonPath, string mediaRoot, string exifTool, Action<string> log)
         {
             List<Photo> cloud = LoadPhotos(jsonPath);
-            if (!File.Exists(exifTool)) throw new ExportException("工具内置的 ExifTool 不完整，请重新解压完整 ZIP。 ");
+            if (!File.Exists(exifTool)) throw new ExportException("工具内置的 ExifTool 不完整，请检查程序目录中的 exiftool 文件夹。 ");
             log("清单中有 " + cloud.Count + " 条带一刻日期的记录。正在扫描本地目录……");
             List<LocalFile> local = FindFiles(mediaRoot, log);
             if (local.Count == 0) throw new ExportException("所选目录及其子目录中没有支持的照片或视频文件。 ");
@@ -947,8 +955,8 @@ namespace YikeExporter
                     else plan.Unmatched++;
                 }
             }
-            Dictionary<string, Dictionary<string, object>> metadata = ReadExistingDates(exifTool, mediaRoot, log);
             List<DatePlanItem> matched = plan.Items;
+            Dictionary<string, Dictionary<string, object>> metadata = ReadExistingDates(exifTool, matched.Select(item => item.Local), log);
             plan.Items = new List<DatePlanItem>();
             foreach (DatePlanItem item in matched)
             {
