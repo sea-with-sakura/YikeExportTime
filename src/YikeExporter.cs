@@ -531,7 +531,7 @@ namespace YikeExporter
         private string lastDirectory;
         public MainForm()
         {
-            Text = "一刻相册 · 照片日期清单导出与写入 v1.1.0";
+            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.0";
             Size = new Size(900, 810);
             MinimumSize = new Size(900, 760);
             StartPosition = FormStartPosition.CenterScreen;
@@ -683,6 +683,7 @@ namespace YikeExporter
         public List<DatePlanItem> Items = new List<DatePlanItem>();
         public int FilesScanned;
         public int Md5FilesChecked;
+        public int ExistingDateSkipped;
         public int Md5Matches;
         public int NameMatches;
         public int Unmatched;
@@ -806,6 +807,8 @@ namespace YikeExporter
             value = value.Trim();
             DateTimeOffset withOffset;
             if (DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out withOffset)) return withOffset;
+            string[] offsetFormats = { "yyyy:MM:dd HH:mm:sszzz", "yyyy-MM-dd HH:mm:sszzz", "yyyy:MM:dd HH:mm:ss.fffzzz", "yyyy-MM-dd HH:mm:ss.fffzzz" };
+            if (DateTimeOffset.TryParseExact(value, offsetFormats, CultureInfo.InvariantCulture, DateTimeStyles.None, out withOffset)) return withOffset;
             string[] formats = { "yyyy:MM:dd HH:mm:ss", "yyyy-MM-dd HH:mm:ss", "yyyy:MM:dd HH:mm:ss.fff", "yyyy-MM-dd HH:mm:ss.fff" };
             DateTime local;
             if (DateTime.TryParseExact(value, formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out local))
@@ -945,13 +948,17 @@ namespace YikeExporter
                 }
             }
             Dictionary<string, Dictionary<string, object>> metadata = ReadExistingDates(exifTool, mediaRoot, log);
-            foreach (DatePlanItem item in plan.Items)
+            List<DatePlanItem> matched = plan.Items;
+            plan.Items = new List<DatePlanItem>();
+            foreach (DatePlanItem item in matched)
             {
                 DateTimeOffset? album = ParseDate(item.Cloud.album_time_china);
                 Dictionary<string, object> tags;
                 if (metadata.TryGetValue(NormalizePath(item.Local.Path), out tags)) item.ExistingDate = ExistingDate(tags);
+                if (item.ExistingDate.HasValue) { plan.ExistingDateSkipped++; continue; }
                 item.AlbumDate = album.Value;
-                item.TargetDate = item.ExistingDate.HasValue && item.ExistingDate.Value < item.AlbumDate ? item.ExistingDate.Value : item.AlbumDate;
+                item.TargetDate = item.AlbumDate;
+                plan.Items.Add(item);
             }
             return plan;
         }
@@ -1040,7 +1047,7 @@ namespace YikeExporter
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             float[] rows = { 45, 45, 28, 38, 28, 38, 46, 28 }; foreach (float row in rows) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, row)); layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); Controls.Add(layout);
             layout.Controls.Add(new Label { Text = "本地媒体日期写入", Font = new Font(Font.FontFamily, 18, FontStyle.Bold), Dock = DockStyle.Fill }, 0, 0);
-            layout.Controls.Add(new Label { Text = "依据一刻导出清单写入媒体元数据。目标日期取一刻记录日期与文件现有拍摄日期中的较早值。", Dock = DockStyle.Fill }, 0, 1);
+            layout.Controls.Add(new Label { Text = "依据一刻导出清单补写媒体元数据。仅处理未检测到拍摄日期的文件，已有日期的文件保持不变。", Dock = DockStyle.Fill }, 0, 1);
             layout.Controls.Add(new Label { Text = "一刻清单文件（photos.json）", Dock = DockStyle.Fill }, 0, 2);
             jsonBox = new TextBox { Dock = DockStyle.Fill }; layout.Controls.Add(BrowseRow(jsonBox, "选择 photos.json", false), 0, 3);
             layout.Controls.Add(new Label { Text = "媒体根目录（包含子目录）", Dock = DockStyle.Fill }, 0, 4);
@@ -1068,7 +1075,7 @@ namespace YikeExporter
             try
             {
                 DatePlan plan = await Task.Run(() => DateWriteEngine.Build(json, media, ExifToolPath, AddLog));
-                AddLog("匹配完成：文件名 " + plan.NameMatches + "，MD5 " + plan.Md5Matches + "（校验 " + plan.Md5FilesChecked + " 个重名文件），未匹配 " + plan.Unmatched + "，歧义 " + plan.Ambiguous + "。 ");
+                AddLog("匹配完成：文件名 " + plan.NameMatches + "，MD5 " + plan.Md5Matches + "（校验 " + plan.Md5FilesChecked + " 个重名文件），已有日期跳过 " + plan.ExistingDateSkipped + "，未匹配 " + plan.Unmatched + "，歧义 " + plan.Ambiguous + "。 ");
                 if (plan.Items.Count == 0) { AddLog("没有可处理的文件。 "); return; }
                 AddLog("开始写入 " + plan.Items.Count + " 个文件的日期元数据。 ");
                 int count = await Task.Run(() => DateWriteEngine.Write(plan, ExifToolPath, AddLog));
