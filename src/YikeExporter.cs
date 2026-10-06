@@ -1297,6 +1297,8 @@ namespace YikeExporter
             };
             using (Process process = Process.Start(start))
             {
+                process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs args) { };
+                process.BeginErrorReadLine();
                 StreamWriter input = process.StandardInput;
                 for (int i = 0; i < images.Count; i++)
                 {
