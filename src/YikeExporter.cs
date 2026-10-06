@@ -531,7 +531,7 @@ namespace YikeExporter
         private string lastDirectory;
         public MainForm()
         {
-            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.5";
+            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.6";
             Size = new Size(900, 810);
             MinimumSize = new Size(900, 760);
             StartPosition = FormStartPosition.CenterScreen;
@@ -676,11 +676,13 @@ namespace YikeExporter
         public DateTimeOffset? ExistingDate;
         public DateTimeOffset TargetDate;
         public bool IsVideo;
+        public bool DateWritten;
     }
 
     public sealed class DatePlan
     {
         public List<DatePlanItem> Items = new List<DatePlanItem>();
+        public List<DatePlanItem> FileTimeItems = new List<DatePlanItem>();
         public int FilesScanned;
         public int Md5FilesChecked;
         public int ExistingDateSkipped;
@@ -1240,10 +1242,11 @@ namespace YikeExporter
                 DateTimeOffset? existing;
                 if (!metadata.TryGetValue(NormalizePath(item.Local.Path), out existing)) { plan.Unsupported++; continue; }
                 item.ExistingDate = existing;
-                if (item.ExistingDate.HasValue) { plan.ExistingDateSkipped++; continue; }
+                if (item.ExistingDate.HasValue) { plan.ExistingDateSkipped++; plan.FileTimeItems.Add(item); continue; }
                 item.AlbumDate = album.Value;
                 item.TargetDate = item.AlbumDate;
                 plan.Items.Add(item);
+                plan.FileTimeItems.Add(item);
             }
             return plan;
         }
@@ -1259,6 +1262,26 @@ namespace YikeExporter
                 File.SetLastWriteTime(path, local);
             }
             catch (Exception ex) { log("已写入媒体日期，但无法同步 Windows 文件日期：" + path + "（" + ex.Message + "）"); }
+        }
+        public static int ApplySystemDates(DatePlan plan, Action<string> log)
+        {
+            int updated = 0;
+            for (int i = 0; i < plan.FileTimeItems.Count; i++)
+            {
+                DatePlanItem item = plan.FileTimeItems[i];
+                DateTimeOffset? date = item.ExistingDate.HasValue ? item.ExistingDate : (item.DateWritten ? (DateTimeOffset?)item.TargetDate : null);
+                if (!date.HasValue) continue;
+                try
+                {
+                    DateTime local = date.Value.ToOffset(TimeSpan.FromHours(8)).DateTime;
+                    File.SetCreationTime(item.Local.Path, local);
+                    File.SetLastWriteTime(item.Local.Path, local);
+                    updated++;
+                }
+                catch (Exception ex) { log("无法同步 Windows 文件日期：" + item.Local.Path + "（" + ex.Message + "）"); }
+                if ((i + 1) % 500 == 0 || i + 1 == plan.FileTimeItems.Count) log("正在同步 Windows 文件日期：" + (i + 1) + "/" + plan.FileTimeItems.Count + "。 ");
+            }
+            return updated;
         }
         private static string ContentExtension(string path)
         {
@@ -1390,7 +1413,7 @@ namespace YikeExporter
                 try
                 {
                     int fields = QuickTimeDatePatcher.Patch(item.Local.Path, item.TargetDate);
-                    if (fields > 0) { updated++; SetSystemDates(item.Local.Path, item.TargetDate, log); }
+                    if (fields > 0) { updated++; item.DateWritten = true; SetSystemDates(item.Local.Path, item.TargetDate, log); }
                     else log("未写入视频：未找到可修改的 QuickTime 时间字段：" + item.Local.Path);
                 }
                 catch (Exception ex) { log("未写入视频：" + item.Local.Path + "（" + ex.Message + "）"); }
@@ -1421,8 +1444,8 @@ namespace YikeExporter
                             if (line.IndexOf("1 image files updated", StringComparison.OrdinalIgnoreCase) >= 0) ok = true;
                             if (line == ready) break;
                         }
-                        if (ok) { updated++; RestoreOriginalPath(item.Local.Path, temporaryPath, log); temporaryPath = null; SetSystemDates(item.Local.Path, item.TargetDate, log); }
-                        else if (String.IsNullOrEmpty(temporaryPath) && RewriteBrokenJpegExif(item.Local.Path, item.TargetDate)) { updated++; SetSystemDates(item.Local.Path, item.TargetDate, log); }
+                        if (ok) { updated++; item.DateWritten = true; RestoreOriginalPath(item.Local.Path, temporaryPath, log); temporaryPath = null; SetSystemDates(item.Local.Path, item.TargetDate, log); }
+                        else if (String.IsNullOrEmpty(temporaryPath) && RewriteBrokenJpegExif(item.Local.Path, item.TargetDate)) { updated++; item.DateWritten = true; SetSystemDates(item.Local.Path, item.TargetDate, log); }
                         else log("未写入：" + item.Local.Path);
                     }
                     catch (Exception ex) { log("未写入：" + item.Local.Path + "（" + ex.Message + "）"); }
@@ -1478,10 +1501,15 @@ namespace YikeExporter
             {
                 DatePlan plan = await Task.Run(() => DateWriteEngine.Build(json, media, ExifToolPath, AddLog));
                 AddLog("匹配完成：文件名 " + plan.NameMatches + "，MD5 " + plan.Md5Matches + "（校验 " + plan.Md5FilesChecked + " 个重名文件），已有日期跳过 " + plan.ExistingDateSkipped + "，无法确认日期跳过 " + plan.Unsupported + "，未匹配 " + plan.Unmatched + "，歧义 " + plan.Ambiguous + "。 ");
-                if (plan.Items.Count == 0) { AddLog("没有可处理的文件。 "); return; }
-                AddLog("开始写入 " + plan.Items.Count + " 个文件的日期元数据。 ");
-                int count = await Task.Run(() => DateWriteEngine.Write(plan, ExifToolPath, AddLog));
-                AddLog("处理完成：已写入 " + count + "/" + plan.Items.Count + " 个文件。 ");
+                int count = 0;
+                if (plan.Items.Count > 0)
+                {
+                    AddLog("开始写入 " + plan.Items.Count + " 个文件的日期元数据。 ");
+                    count = await Task.Run(() => DateWriteEngine.Write(plan, ExifToolPath, AddLog));
+                    AddLog("媒体日期写入完成：" + count + "/" + plan.Items.Count + " 个文件。 ");
+                }
+                int fileDates = await Task.Run(() => DateWriteEngine.ApplySystemDates(plan, AddLog));
+                AddLog("Windows 文件日期同步完成：" + fileDates + "/" + plan.FileTimeItems.Count + " 个文件。 ");
             }
             catch (ExportException ex) { AddLog(ex.Message); }
             catch (Exception ex) { AddLog("处理失败：" + ex.Message); }
