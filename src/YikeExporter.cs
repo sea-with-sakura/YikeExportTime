@@ -531,7 +531,7 @@ namespace YikeExporter
         private string lastDirectory;
         public MainForm()
         {
-            Text = "一刻相册 · 照片日期清单导出与写入 v1.0.0";
+            Text = "一刻相册 · 照片日期清单导出与写入 v1.1.0";
             Size = new Size(900, 810);
             MinimumSize = new Size(900, 760);
             StartPosition = FormStartPosition.CenterScreen;
@@ -688,6 +688,102 @@ namespace YikeExporter
         public int Unmatched;
         public int Ambiguous;
         public int Unsupported;
+    }
+
+    public static class QuickTimeDatePatcher
+    {
+        private static readonly HashSet<string> Containers = new HashSet<string>(new[] { "moov", "trak", "mdia" }, StringComparer.Ordinal);
+        private static readonly DateTimeOffset Epoch = new DateTimeOffset(1904, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        private static uint ReadUInt32(byte[] value, int offset)
+        {
+            return ((uint)value[offset] << 24) | ((uint)value[offset + 1] << 16) | ((uint)value[offset + 2] << 8) | value[offset + 3];
+        }
+        private static ulong ReadUInt64(byte[] value, int offset)
+        {
+            ulong result = 0;
+            for (int i = 0; i < 8; i++) result = (result << 8) | value[offset + i];
+            return result;
+        }
+        private static void WriteUInt32(FileStream file, long offset, uint value)
+        {
+            file.Position = offset;
+            file.WriteByte((byte)(value >> 24)); file.WriteByte((byte)(value >> 16)); file.WriteByte((byte)(value >> 8)); file.WriteByte((byte)value);
+        }
+        private static void WriteUInt64(FileStream file, long offset, ulong value)
+        {
+            byte[] bytes = new byte[8];
+            for (int i = 7; i >= 0; i--) { bytes[i] = (byte)value; value >>= 8; }
+            file.Position = offset; file.Write(bytes, 0, bytes.Length);
+        }
+        private static bool ReadExactly(FileStream file, byte[] buffer)
+        {
+            int offset = 0, count;
+            while (offset < buffer.Length && (count = file.Read(buffer, offset, buffer.Length - offset)) > 0) offset += count;
+            return offset == buffer.Length;
+        }
+        private static int PatchDateAtom(FileStream file, long atomOffset, long atomSize, int headerSize, ulong seconds)
+        {
+            long dataOffset = atomOffset + headerSize;
+            if (atomSize < headerSize + 12) return 0;
+            file.Position = dataOffset;
+            int version = file.ReadByte();
+            if (version == 0)
+            {
+                if (seconds > UInt32.MaxValue || atomSize < headerSize + 12) return 0;
+                WriteUInt32(file, dataOffset + 4, (uint)seconds);
+                WriteUInt32(file, dataOffset + 8, (uint)seconds);
+                return 1;
+            }
+            if (version == 1)
+            {
+                if (atomSize < headerSize + 20) return 0;
+                WriteUInt64(file, dataOffset + 4, seconds);
+                WriteUInt64(file, dataOffset + 12, seconds);
+                return 1;
+            }
+            return 0;
+        }
+        private static int Scan(FileStream file, long start, long end, ulong seconds)
+        {
+            int changed = 0;
+            long position = start;
+            byte[] header = new byte[16];
+            byte[] basic = new byte[8];
+            while (position + 8 <= end)
+            {
+                file.Position = position;
+                if (!ReadExactly(file, basic)) break;
+                ulong size = ReadUInt32(basic, 0);
+                string type = Encoding.ASCII.GetString(basic, 4, 4);
+                int headerSize = 8;
+                if (size == 1)
+                {
+                    file.Position = position;
+                    if (!ReadExactly(file, header)) break;
+                    size = ReadUInt64(header, 8); headerSize = 16;
+                }
+                else if (size == 0) size = (ulong)(end - position);
+                if (size < (ulong)headerSize || size > (ulong)(end - position)) break;
+                long atomSize = (long)size;
+                if (type == "mvhd" || type == "tkhd" || type == "mdhd") changed += PatchDateAtom(file, position, atomSize, headerSize, seconds);
+                else if (Containers.Contains(type)) changed += Scan(file, position + headerSize, position + atomSize, seconds);
+                position += atomSize;
+            }
+            return changed;
+        }
+        public static int Patch(string path, DateTimeOffset target)
+        {
+            double totalSeconds = (target.ToUniversalTime() - Epoch).TotalSeconds;
+            if (totalSeconds < 0 || totalSeconds > UInt64.MaxValue) throw new ExportException("视频日期超出 QuickTime 支持范围：" + path);
+            ulong seconds = (ulong)Math.Floor(totalSeconds);
+            using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            {
+                int changed = Scan(file, 0, file.Length, seconds);
+                file.Flush(true);
+                return changed;
+            }
+        }
     }
 
     public static class DateWriteEngine
@@ -878,38 +974,41 @@ namespace YikeExporter
             string withOffset = LocalDateWithOffset(item.TargetDate);
             // The packaged Windows ExifTool receives standard input in the active Windows code page.
             Send(input, "-charset"); Send(input, "filename=cp936");
-            Send(input, "-api"); Send(input, "QuickTimeUTC=1");
             Send(input, "-overwrite_original");
-            if (item.IsVideo)
-            {
-                // With QuickTimeUTC enabled, provide local wall-clock time; ExifTool stores the UTC value and readers convert it back.
-                Send(input, "-QuickTime:CreateDate=" + local); Send(input, "-QuickTime:ModifyDate=" + local);
-                Send(input, "-TrackCreateDate=" + local); Send(input, "-TrackModifyDate=" + local);
-                Send(input, "-MediaCreateDate=" + local); Send(input, "-MediaModifyDate=" + local);
-                Send(input, "-QuickTime:CreationDate=" + withOffset); Send(input, "-XMP-exif:DateTimeOriginal=" + withOffset);
-            }
-            else
-            {
-                Send(input, "-EXIF:DateTimeOriginal=" + local); Send(input, "-EXIF:CreateDate=" + local); Send(input, "-EXIF:ModifyDate=" + local);
-                Send(input, "-EXIF:OffsetTimeOriginal=+08:00"); Send(input, "-XMP-exif:DateTimeOriginal=" + withOffset);
-                Send(input, "-XMP-xmp:CreateDate=" + withOffset); Send(input, "-XMP-xmp:ModifyDate=" + withOffset);
-            }
+            Send(input, "-EXIF:DateTimeOriginal=" + local); Send(input, "-EXIF:CreateDate=" + local); Send(input, "-EXIF:ModifyDate=" + local);
+            Send(input, "-EXIF:OffsetTimeOriginal=+08:00"); Send(input, "-XMP-exif:DateTimeOriginal=" + withOffset);
+            Send(input, "-XMP-xmp:CreateDate=" + withOffset); Send(input, "-XMP-xmp:ModifyDate=" + withOffset);
             Send(input, "-FileCreateDate=" + local); Send(input, "-FileModifyDate=" + local);
             Send(input, item.Local.Path); Send(input, "-execute" + number);
         }
         public static int Write(DatePlan plan, string exifTool, Action<string> log)
         {
+            int updated = 0;
+            List<DatePlanItem> videos = plan.Items.Where(item => item.IsVideo).ToList();
+            List<DatePlanItem> images = plan.Items.Where(item => !item.IsVideo).ToList();
+            for (int i = 0; i < videos.Count; i++)
+            {
+                DatePlanItem item = videos[i];
+                try
+                {
+                    int fields = QuickTimeDatePatcher.Patch(item.Local.Path, item.TargetDate);
+                    if (fields > 0) { updated++; SetSystemDates(item.Local.Path, item.TargetDate, log); }
+                    else log("未写入视频：未找到可修改的 QuickTime 时间字段：" + item.Local.Path);
+                }
+                catch (Exception ex) { log("未写入视频：" + item.Local.Path + "（" + ex.Message + "）"); }
+                if ((i + 1) % 25 == 0 || i + 1 == videos.Count) log("正在快速写入视频：" + (i + 1) + "/" + videos.Count + "。 ");
+            }
+            if (images.Count == 0) return updated;
             ProcessStartInfo start = new ProcessStartInfo {
                 FileName = exifTool, Arguments = "-stay_open True -@ -", UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true,
                 StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
             };
-            int updated = 0;
             using (Process process = Process.Start(start))
             {
                 StreamWriter input = process.StandardInput;
-                for (int i = 0; i < plan.Items.Count; i++)
+                for (int i = 0; i < images.Count; i++)
                 {
-                    DatePlanItem item = plan.Items[i];
+                    DatePlanItem item = images[i];
                     WriteOne(input, item, i + 1);
                     string ready = "{ready" + (i + 1) + "}";
                     bool ok = false; string line;
@@ -919,7 +1018,7 @@ namespace YikeExporter
                         if (line == ready) break;
                     }
                     if (ok) { updated++; SetSystemDates(item.Local.Path, item.TargetDate, log); } else log("未写入：" + item.Local.Path);
-                    if ((i + 1) % 25 == 0 || i + 1 == plan.Items.Count) log("正在写入：" + (i + 1) + "/" + plan.Items.Count);
+                    if ((i + 1) % 25 == 0 || i + 1 == images.Count) log("正在写入图片：" + (i + 1) + "/" + images.Count + "。 ");
                 }
                 Send(input, "-stay_open"); Send(input, "False");
                 process.WaitForExit();

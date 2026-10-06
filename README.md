@@ -4,7 +4,7 @@ Windows 工具，用于导出一刻相册的照片日期清单，并将日期写
 
 ## 发布包
 
-下载 `release/YikeExportTime-v1.0.0.zip`，完整解压后运行 `一刻日期导出.exe`。发布包包含所需的 ExifTool 组件，无需额外安装 Python、Node.js 或 ExifTool。
+下载 `release/YikeExportTime-v1.1.0.zip`，完整解压后运行 `一刻日期导出.exe`。发布包包含所需的 ExifTool 组件，无需额外安装 Python、Node.js 或 ExifTool。
 
 ## 功能
 
@@ -12,7 +12,7 @@ Windows 工具，用于导出一刻相册的照片日期清单，并将日期写
 - 保留一刻接口的 `shoot_time`、时区、云端创建和修改日期
 - 导出图片和视频，默认移除 `category` 类型限制
 - 按一刻日期与现有媒体拍摄日期的较早值写入本地元数据
-- 图片写入 EXIF/XMP 日期；视频写入 QuickTime 媒体日期，并同步 Windows 文件日期
+- 图片写入 EXIF/XMP 日期；MP4/MOV 等视频直接修改 QuickTime 时间字段，并同步 Windows 文件日期
 - 云端和本地文件名均唯一时直接匹配；仅对重名文件通过 MD5 校验
 - 重名、未匹配或仍有歧义的文件不写入
 
@@ -24,6 +24,8 @@ Windows 工具，用于导出一刻相册的照片日期清单，并将日期写
 4. 选择本次导出的 `photos.json` 和已下载媒体所在目录，点击“开始处理”。
 
 写入功能不生成 `*_original` 备份文件，也不保存预览 CSV。使用前请自行确认本地媒体目录范围。
+
+`v1.1.0` 的 MP4/MOV 写入仅访问容器索引和固定时间字段，不重建完整视频文件，适用于 FNOS SMB 挂载目录。
 
 ## 构建
 
