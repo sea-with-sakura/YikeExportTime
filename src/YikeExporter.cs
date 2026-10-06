@@ -531,7 +531,7 @@ namespace YikeExporter
         private string lastDirectory;
         public MainForm()
         {
-            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.3";
+            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.5";
             Size = new Size(900, 810);
             MinimumSize = new Size(900, 760);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1260,7 +1260,113 @@ namespace YikeExporter
             }
             catch (Exception ex) { log("已写入媒体日期，但无法同步 Windows 文件日期：" + path + "（" + ex.Message + "）"); }
         }
-        private static void WriteOne(StreamWriter input, DatePlanItem item, int number)
+        private static string ContentExtension(string path)
+        {
+            try
+            {
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    byte[] header = new byte[12];
+                    if (!ReadFully(file, header)) return null;
+                    if (header[0] == 137 && Encoding.ASCII.GetString(header, 1, 3) == "PNG") return ".png";
+                    if (Encoding.ASCII.GetString(header, 0, 4) == "RIFF" && Encoding.ASCII.GetString(header, 8, 4) == "WEBP") return ".webp";
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            return null;
+        }
+        private static string PrepareExifPath(string originalPath, out string temporaryPath)
+        {
+            temporaryPath = null;
+            string extension = ContentExtension(originalPath);
+            if (String.IsNullOrEmpty(extension) || extension.Equals(Path.GetExtension(originalPath), StringComparison.OrdinalIgnoreCase)) return originalPath;
+            temporaryPath = originalPath + ".yike-date-" + Guid.NewGuid().ToString("N") + extension;
+            File.Move(originalPath, temporaryPath);
+            return temporaryPath;
+        }
+        private static void RestoreOriginalPath(string originalPath, string temporaryPath, Action<string> log)
+        {
+            if (String.IsNullOrEmpty(temporaryPath) || !File.Exists(temporaryPath)) return;
+            try { File.Move(temporaryPath, originalPath); }
+            catch (Exception ex) { log("临时文件无法恢复原始名称：" + temporaryPath + "（" + ex.Message + "）"); }
+        }
+        private static void LittleUInt16(byte[] value, int offset, ushort number) { value[offset] = (byte)number; value[offset + 1] = (byte)(number >> 8); }
+        private static void LittleUInt32(byte[] value, int offset, uint number) { value[offset] = (byte)number; value[offset + 1] = (byte)(number >> 8); value[offset + 2] = (byte)(number >> 16); value[offset + 3] = (byte)(number >> 24); }
+        private static void ExifEntry(byte[] value, int offset, ushort tag, ushort type, uint count, uint dataOffset)
+        {
+            LittleUInt16(value, offset, tag); LittleUInt16(value, offset + 2, type); LittleUInt32(value, offset + 4, count); LittleUInt32(value, offset + 8, dataOffset);
+        }
+        private static byte[] CleanExif(DateTimeOffset date)
+        {
+            byte[] value = new byte[153];
+            Encoding.ASCII.GetBytes("Exif\0\0").CopyTo(value, 0);
+            int tiff = 6;
+            value[tiff] = (byte)'I'; value[tiff + 1] = (byte)'I'; LittleUInt16(value, tiff + 2, 42); LittleUInt32(value, tiff + 4, 8);
+            LittleUInt16(value, tiff + 8, 2);
+            ExifEntry(value, tiff + 10, 0x0132, 2, 20, 80);
+            ExifEntry(value, tiff + 22, 0x8769, 4, 1, 38);
+            LittleUInt32(value, tiff + 34, 0);
+            LittleUInt16(value, tiff + 38, 3);
+            ExifEntry(value, tiff + 40, 0x9003, 2, 20, 100);
+            ExifEntry(value, tiff + 52, 0x9004, 2, 20, 120);
+            ExifEntry(value, tiff + 64, 0x9011, 2, 7, 140);
+            LittleUInt32(value, tiff + 76, 0);
+            string local = LocalDate(date);
+            Encoding.ASCII.GetBytes(local + "\0").CopyTo(value, tiff + 80);
+            Encoding.ASCII.GetBytes(local + "\0").CopyTo(value, tiff + 100);
+            Encoding.ASCII.GetBytes(local + "\0").CopyTo(value, tiff + 120);
+            Encoding.ASCII.GetBytes("+08:00\0").CopyTo(value, tiff + 140);
+            return value;
+        }
+        private static bool IsExifSegment(byte[] value) { return value.Length >= 6 && Encoding.ASCII.GetString(value, 0, 6) == "Exif\0\0"; }
+        private static void WriteJpegSegment(Stream output, int marker, byte[] data)
+        {
+            output.WriteByte(0xff); output.WriteByte((byte)marker);
+            int length = data.Length + 2;
+            output.WriteByte((byte)(length >> 8)); output.WriteByte((byte)length);
+            output.Write(data, 0, data.Length);
+        }
+        private static bool RewriteBrokenJpegExif(string path, DateTimeOffset date)
+        {
+            string temporary = path + ".yike-date-rebuild-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                using (FileStream input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (FileStream output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    if (input.ReadByte() != 0xff || input.ReadByte() != 0xd8) return false;
+                    output.WriteByte(0xff); output.WriteByte(0xd8); WriteJpegSegment(output, 0xe1, CleanExif(date));
+                    while (input.Position < input.Length)
+                    {
+                        int prefix = input.ReadByte();
+                        if (prefix != 0xff) return false;
+                        int marker; do { marker = input.ReadByte(); } while (marker == 0xff && input.Position < input.Length);
+                        if (marker < 0) return false;
+                        if (marker == 0xd9 || marker == 0x01 || marker >= 0xd0 && marker <= 0xd7)
+                        {
+                            output.WriteByte(0xff); output.WriteByte((byte)marker);
+                            if (marker == 0xd9) break;
+                            continue;
+                        }
+                        int high = input.ReadByte(), low = input.ReadByte();
+                        int length = (high << 8) | low;
+                        if (high < 0 || low < 0 || length < 2) return false;
+                        byte[] data = new byte[length - 2];
+                        if (!ReadFully(input, data)) return false;
+                        if (!(marker == 0xe1 && IsExifSegment(data))) WriteJpegSegment(output, marker, data);
+                        if (marker == 0xda) { input.CopyTo(output); break; }
+                    }
+                    output.Flush(true);
+                }
+                File.Replace(temporary, path, null, true);
+                return true;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        }
+        private static void WriteOne(StreamWriter input, string path, DatePlanItem item, int number)
         {
             string local = LocalDate(item.TargetDate);
             string withOffset = LocalDateWithOffset(item.TargetDate);
@@ -1271,7 +1377,7 @@ namespace YikeExporter
             Send(input, "-EXIF:OffsetTimeOriginal=+08:00"); Send(input, "-XMP-exif:DateTimeOriginal=" + withOffset);
             Send(input, "-XMP-xmp:CreateDate=" + withOffset); Send(input, "-XMP-xmp:ModifyDate=" + withOffset);
             Send(input, "-FileCreateDate=" + local); Send(input, "-FileModifyDate=" + local);
-            Send(input, item.Local.Path); Send(input, "-execute" + number);
+            Send(input, path); Send(input, "-execute" + number);
         }
         public static int Write(DatePlan plan, string exifTool, Action<string> log)
         {
@@ -1303,15 +1409,24 @@ namespace YikeExporter
                 for (int i = 0; i < images.Count; i++)
                 {
                     DatePlanItem item = images[i];
-                    WriteOne(input, item, i + 1);
-                    string ready = "{ready" + (i + 1) + "}";
-                    bool ok = false; string line;
-                    while ((line = process.StandardOutput.ReadLine()) != null)
+                    string temporaryPath = null;
+                    try
                     {
-                        if (line.IndexOf("1 image files updated", StringComparison.OrdinalIgnoreCase) >= 0) ok = true;
-                        if (line == ready) break;
+                        string writePath = PrepareExifPath(item.Local.Path, out temporaryPath);
+                        WriteOne(input, writePath, item, i + 1);
+                        string ready = "{ready" + (i + 1) + "}";
+                        bool ok = false; string line;
+                        while ((line = process.StandardOutput.ReadLine()) != null)
+                        {
+                            if (line.IndexOf("1 image files updated", StringComparison.OrdinalIgnoreCase) >= 0) ok = true;
+                            if (line == ready) break;
+                        }
+                        if (ok) { updated++; RestoreOriginalPath(item.Local.Path, temporaryPath, log); temporaryPath = null; SetSystemDates(item.Local.Path, item.TargetDate, log); }
+                        else if (String.IsNullOrEmpty(temporaryPath) && RewriteBrokenJpegExif(item.Local.Path, item.TargetDate)) { updated++; SetSystemDates(item.Local.Path, item.TargetDate, log); }
+                        else log("未写入：" + item.Local.Path);
                     }
-                    if (ok) { updated++; SetSystemDates(item.Local.Path, item.TargetDate, log); } else log("未写入：" + item.Local.Path);
+                    catch (Exception ex) { log("未写入：" + item.Local.Path + "（" + ex.Message + "）"); }
+                    finally { RestoreOriginalPath(item.Local.Path, temporaryPath, log); }
                     if ((i + 1) % 25 == 0 || i + 1 == images.Count) log("正在写入图片：" + (i + 1) + "/" + images.Count + "。 ");
                 }
                 Send(input, "-stay_open"); Send(input, "False");
