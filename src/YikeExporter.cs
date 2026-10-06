@@ -531,7 +531,7 @@ namespace YikeExporter
         private string lastDirectory;
         public MainForm()
         {
-            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.1";
+            Text = "一刻相册 · 照片日期清单导出与写入 v1.2.2";
             Size = new Size(900, 810);
             MinimumSize = new Size(900, 760);
             StartPosition = FormStartPosition.CenterScreen;
@@ -773,6 +773,76 @@ namespace YikeExporter
             }
             return changed;
         }
+        private static DateTimeOffset? ReadDateAtom(FileStream file, long atomOffset, long atomSize, int headerSize)
+        {
+            long dataOffset = atomOffset + headerSize;
+            if (atomSize < headerSize + 12) return null;
+            file.Position = dataOffset;
+            int version = file.ReadByte();
+            if (version == 0)
+            {
+                byte[] value = new byte[4];
+                file.Position = dataOffset + 4;
+                if (!ReadExactly(file, value)) return null;
+                uint seconds = ReadUInt32(value, 0);
+                return seconds == 0 ? (DateTimeOffset?)null : Epoch.AddSeconds(seconds);
+            }
+            if (version == 1)
+            {
+                byte[] value = new byte[8];
+                file.Position = dataOffset + 4;
+                if (!ReadExactly(file, value)) return null;
+                ulong seconds = ReadUInt64(value, 0);
+                return seconds == 0 || seconds > Int64.MaxValue ? (DateTimeOffset?)null : Epoch.AddSeconds((long)seconds);
+            }
+            return null;
+        }
+        private static DateTimeOffset? ScanForDate(FileStream file, long start, long end)
+        {
+            DateTimeOffset? earliest = null;
+            long position = start;
+            byte[] header = new byte[16];
+            byte[] basic = new byte[8];
+            while (position + 8 <= end)
+            {
+                file.Position = position;
+                if (!ReadExactly(file, basic)) break;
+                ulong size = ReadUInt32(basic, 0);
+                string type = Encoding.ASCII.GetString(basic, 4, 4);
+                int headerSize = 8;
+                if (size == 1)
+                {
+                    file.Position = position;
+                    if (!ReadExactly(file, header)) break;
+                    size = ReadUInt64(header, 8); headerSize = 16;
+                }
+                else if (size == 0) size = (ulong)(end - position);
+                if (size < (ulong)headerSize || size > (ulong)(end - position)) break;
+                long atomSize = (long)size;
+                DateTimeOffset? date = null;
+                if (type == "mvhd" || type == "tkhd" || type == "mdhd") date = ReadDateAtom(file, position, atomSize, headerSize);
+                else if (Containers.Contains(type)) date = ScanForDate(file, position + headerSize, position + atomSize);
+                if (date.HasValue && (!earliest.HasValue || date.Value < earliest.Value)) earliest = date;
+                position += atomSize;
+            }
+            return earliest;
+        }
+        public static bool TryReadCreatedDate(string path, out DateTimeOffset? date)
+        {
+            date = null;
+            try
+            {
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    byte[] header = new byte[12];
+                    if (!ReadExactly(file, header) || Encoding.ASCII.GetString(header, 4, 4) != "ftyp") return false;
+                    date = ScanForDate(file, 0, file.Length);
+                    return true;
+                }
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
         public static int Patch(string path, DateTimeOffset target)
         {
             double totalSeconds = (target.ToUniversalTime() - Epoch).TotalSeconds;
@@ -796,6 +866,17 @@ namespace YikeExporter
         public static bool IsVideo(string path) { return Videos.Contains(Path.GetExtension(path)); }
         private static string Quote(string text) { return "\"" + text.Replace("\"", "\\\"") + "\""; }
         private static string NormalizePath(string path) { return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar).ToLowerInvariant(); }
+        private static bool ReadFully(Stream stream, byte[] buffer)
+        {
+            int offset = 0;
+            while (offset < buffer.Length)
+            {
+                int count = stream.Read(buffer, offset, buffer.Length - offset);
+                if (count <= 0) return false;
+                offset += count;
+            }
+            return true;
+        }
         private static string Md5(string path)
         {
             using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
@@ -831,6 +912,135 @@ namespace YikeExporter
                 if (date.HasValue && (!earliest.HasValue || date.Value < earliest.Value)) earliest = date;
             }
             return earliest;
+        }
+        private static ushort TiffUInt16(byte[] data, int offset, bool little)
+        {
+            if (offset < 0 || offset + 2 > data.Length) return 0;
+            return little ? (ushort)(data[offset] | (data[offset + 1] << 8)) : (ushort)((data[offset] << 8) | data[offset + 1]);
+        }
+        private static uint TiffUInt32(byte[] data, int offset, bool little)
+        {
+            if (offset < 0 || offset + 4 > data.Length) return 0;
+            if (little) return (uint)(data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24));
+            return ((uint)data[offset] << 24) | ((uint)data[offset + 1] << 16) | ((uint)data[offset + 2] << 8) | data[offset + 3];
+        }
+        private static DateTimeOffset? TiffDateInIfd(byte[] data, int origin, bool little, uint ifdOffset, out uint exifIfd)
+        {
+            exifIfd = 0;
+            long directoryOffset = origin + (long)ifdOffset;
+            if (directoryOffset < 0 || directoryOffset + 2 > data.Length) return null;
+            int count = TiffUInt16(data, (int)directoryOffset, little);
+            DateTimeOffset? earliest = null;
+            for (int i = 0; i < count; i++)
+            {
+                int entry = (int)directoryOffset + 2 + i * 12;
+                if (entry + 12 > data.Length) break;
+                ushort tag = TiffUInt16(data, entry, little);
+                ushort type = TiffUInt16(data, entry + 2, little);
+                uint length = TiffUInt32(data, entry + 4, little);
+                if (tag == 0x8769) { exifIfd = TiffUInt32(data, entry + 8, little); continue; }
+                if ((tag != 0x9003 && tag != 0x9004) || type != 2 || length == 0 || length > 64) continue;
+                long textOffset = length <= 4 ? entry + 8 : origin + (long)TiffUInt32(data, entry + 8, little);
+                if (textOffset < 0 || textOffset + length > data.Length) continue;
+                string value = Encoding.ASCII.GetString(data, (int)textOffset, (int)length).TrimEnd('\0', ' ');
+                DateTimeOffset? date = ParseDate(value);
+                if (date.HasValue && (!earliest.HasValue || date.Value < earliest.Value)) earliest = date;
+            }
+            return earliest;
+        }
+        private static DateTimeOffset? TiffDate(byte[] data, int origin)
+        {
+            if (origin < 0 || origin + 8 > data.Length) return null;
+            bool little = data[origin] == (byte)'I' && data[origin + 1] == (byte)'I';
+            bool big = data[origin] == (byte)'M' && data[origin + 1] == (byte)'M';
+            if (!little && !big || TiffUInt16(data, origin + 2, little) != 42) return null;
+            uint exifIfd;
+            TiffDateInIfd(data, origin, little, TiffUInt32(data, origin + 4, little), out exifIfd);
+            if (exifIfd == 0) return null;
+            uint unused;
+            return TiffDateInIfd(data, origin, little, exifIfd, out unused);
+        }
+        private static DateTimeOffset? XmpDate(byte[] data)
+        {
+            string xml = Encoding.UTF8.GetString(data);
+            string[] names = { "exif:DateTimeOriginal", "xmp:CreateDate", "photoshop:DateCreated" };
+            DateTimeOffset? earliest = null;
+            foreach (string name in names)
+            {
+                string[] starts = { name + "=\"", name + "='", "<" + name + ">" };
+                foreach (string start in starts)
+                {
+                    int index = xml.IndexOf(start, StringComparison.OrdinalIgnoreCase);
+                    if (index < 0) continue;
+                    int valueStart = index + start.Length;
+                    int valueEnd = start.EndsWith(">", StringComparison.Ordinal) ? xml.IndexOf("</", valueStart, StringComparison.Ordinal) : xml.IndexOf(start.EndsWith("'", StringComparison.Ordinal) ? "'" : "\"", valueStart, StringComparison.Ordinal);
+                    if (valueEnd <= valueStart) continue;
+                    DateTimeOffset? date = ParseDate(xml.Substring(valueStart, valueEnd - valueStart).Trim());
+                    if (date.HasValue && (!earliest.HasValue || date.Value < earliest.Value)) earliest = date;
+                }
+            }
+            return earliest;
+        }
+        private static bool TryReadJpegDate(string path, out DateTimeOffset? date)
+        {
+            date = null;
+            try
+            {
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    if (file.ReadByte() != 0xff || file.ReadByte() != 0xd8) return false;
+                    while (file.Position + 4 <= file.Length)
+                    {
+                        int prefix = file.ReadByte();
+                        if (prefix != 0xff) return false;
+                        int marker; do { marker = file.ReadByte(); } while (marker == 0xff && file.Position < file.Length);
+                        if (marker < 0 || marker == 0xd9 || marker == 0xda) return true;
+                        if (marker == 0x01 || marker >= 0xd0 && marker <= 0xd7) continue;
+                        int high = file.ReadByte(), low = file.ReadByte();
+                        int length = (high << 8) | low;
+                        if (high < 0 || low < 0 || length < 2 || file.Position + length - 2 > file.Length) return false;
+                        if (marker != 0xe1) { file.Position += length - 2; continue; }
+                        byte[] segment = new byte[length - 2];
+                        if (!ReadFully(file, segment)) return false;
+                        DateTimeOffset? candidate = null;
+                        if (segment.Length >= 6 && Encoding.ASCII.GetString(segment, 0, 6) == "Exif\0\0") candidate = TiffDate(segment, 6);
+                        else if (segment.Length >= 29 && Encoding.ASCII.GetString(segment, 0, 29) == "http://ns.adobe.com/xap/1.0/\0") candidate = XmpDate(segment);
+                        if (candidate.HasValue && (!date.HasValue || candidate.Value < date.Value)) date = candidate;
+                    }
+                    return true;
+                }
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+        private static bool TryReadTiffDate(string path, out DateTimeOffset? date)
+        {
+            date = null;
+            try
+            {
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    int length = (int)Math.Min(file.Length, 262144);
+                    if (length < 8) return false;
+                    byte[] data = new byte[length];
+                    if (!ReadFully(file, data)) return false;
+                    bool tiff = (data[0] == (byte)'I' && data[1] == (byte)'I') || (data[0] == (byte)'M' && data[1] == (byte)'M');
+                    if (!tiff) return false;
+                    date = TiffDate(data, 0);
+                    return true;
+                }
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+        private static bool TryReadFastDate(LocalFile file, out DateTimeOffset? date)
+        {
+            string extension = Path.GetExtension(file.Path);
+            if (extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase)) return TryReadJpegDate(file.Path, out date);
+            if (extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase) || extension.Equals(".mov", StringComparison.OrdinalIgnoreCase) || extension.Equals(".m4v", StringComparison.OrdinalIgnoreCase) || extension.Equals(".3gp", StringComparison.OrdinalIgnoreCase)) return QuickTimeDatePatcher.TryReadCreatedDate(file.Path, out date);
+            if (extension.Equals(".tif", StringComparison.OrdinalIgnoreCase) || extension.Equals(".tiff", StringComparison.OrdinalIgnoreCase) || extension.Equals(".dng", StringComparison.OrdinalIgnoreCase) || extension.Equals(".cr2", StringComparison.OrdinalIgnoreCase) || extension.Equals(".nef", StringComparison.OrdinalIgnoreCase) || extension.Equals(".arw", StringComparison.OrdinalIgnoreCase) || extension.Equals(".raf", StringComparison.OrdinalIgnoreCase) || extension.Equals(".rw2", StringComparison.OrdinalIgnoreCase)) return TryReadTiffDate(file.Path, out date);
+            date = null;
+            return false;
         }
         private static List<Photo> LoadPhotos(string jsonPath)
         {
@@ -871,15 +1081,31 @@ namespace YikeExporter
             catch (UnauthorizedAccessException) { throw new ExportException("没有权限读取所选目录。请改选可访问的媒体目录。 "); }
             return files;
         }
-        private static Dictionary<string, Dictionary<string, object>> ReadExistingDates(string exifTool, IEnumerable<LocalFile> files, Action<string> log)
+        private static Dictionary<string, DateTimeOffset?> ReadExistingDates(string exifTool, IEnumerable<LocalFile> files, Action<string> log)
         {
             List<LocalFile> targets = files.ToList();
-            Dictionary<string, Dictionary<string, object>> dates = new Dictionary<string, Dictionary<string, object>>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, DateTimeOffset?> dates = new Dictionary<string, DateTimeOffset?>(StringComparer.OrdinalIgnoreCase);
+            List<LocalFile> compatibilityFiles = new List<LocalFile>();
+            int fastFiles = 0;
             const int batchSize = 100;
-            log("正在读取已匹配文件的内嵌日期：0/" + targets.Count + "。 ");
-            for (int offset = 0; offset < targets.Count; offset += batchSize)
+            log("正在快速读取已有日期：0/" + targets.Count + "。 ");
+            for (int i = 0; i < targets.Count; i++)
             {
-                List<LocalFile> batch = targets.Skip(offset).Take(batchSize).ToList();
+                LocalFile file = targets[i];
+                DateTimeOffset? existing;
+                if (TryReadFastDate(file, out existing)) { dates[NormalizePath(file.Path)] = existing; fastFiles++; }
+                else compatibilityFiles.Add(file);
+                if ((i + 1) % 100 == 0 || i + 1 == targets.Count) log("正在快速读取已有日期：" + (i + 1) + "/" + targets.Count + "。 ");
+            }
+            if (compatibilityFiles.Count == 0)
+            {
+                log("已有日期读取完成：快速读取 " + fastFiles + " 个文件。 ");
+                return dates;
+            }
+            log("正在兼容读取 " + compatibilityFiles.Count + " 个其它格式文件的日期：0/" + compatibilityFiles.Count + "。 ");
+            for (int offset = 0; offset < compatibilityFiles.Count; offset += batchSize)
+            {
+                List<LocalFile> batch = compatibilityFiles.Skip(offset).Take(batchSize).ToList();
                 ProcessStartInfo start = new ProcessStartInfo {
                     FileName = exifTool,
                     Arguments = "-j -G1 -s -api QuickTimeUTC=1 -DateTimeOriginal -CreateDate -MediaCreateDate -TrackCreateDate -QuickTime:CreationDate " + String.Join(" ", batch.Select(file => Quote(file.Path))),
@@ -898,12 +1124,14 @@ namespace YikeExporter
                     {
                         Dictionary<string, object> tags = Json.Object(row);
                         string source = Json.Text(Json.Get(tags, "SourceFile"));
-                        if (!String.IsNullOrWhiteSpace(source)) dates[NormalizePath(source)] = tags;
+                        if (!String.IsNullOrWhiteSpace(source)) dates[NormalizePath(source)] = ExistingDate(tags);
                     }
                 }
-                int completed = Math.Min(offset + batch.Count, targets.Count);
-                log("正在读取已匹配文件的内嵌日期：" + completed + "/" + targets.Count + "。 ");
+                int completed = Math.Min(offset + batch.Count, compatibilityFiles.Count);
+                log("正在兼容读取其它格式文件的日期：" + completed + "/" + compatibilityFiles.Count + "。 ");
             }
+            foreach (LocalFile file in compatibilityFiles) if (!dates.ContainsKey(NormalizePath(file.Path))) dates[NormalizePath(file.Path)] = null;
+            log("已有日期读取完成：快速读取 " + fastFiles + " 个文件，兼容读取 " + compatibilityFiles.Count + " 个文件。 ");
             return dates;
         }
         private static string Csv(string text)
@@ -956,13 +1184,13 @@ namespace YikeExporter
                 }
             }
             List<DatePlanItem> matched = plan.Items;
-            Dictionary<string, Dictionary<string, object>> metadata = ReadExistingDates(exifTool, matched.Select(item => item.Local), log);
+            Dictionary<string, DateTimeOffset?> metadata = ReadExistingDates(exifTool, matched.Select(item => item.Local), log);
             plan.Items = new List<DatePlanItem>();
             foreach (DatePlanItem item in matched)
             {
                 DateTimeOffset? album = ParseDate(item.Cloud.album_time_china);
-                Dictionary<string, object> tags;
-                if (metadata.TryGetValue(NormalizePath(item.Local.Path), out tags)) item.ExistingDate = ExistingDate(tags);
+                DateTimeOffset? existing;
+                if (metadata.TryGetValue(NormalizePath(item.Local.Path), out existing)) item.ExistingDate = existing;
                 if (item.ExistingDate.HasValue) { plan.ExistingDateSkipped++; continue; }
                 item.AlbumDate = album.Value;
                 item.TargetDate = item.AlbumDate;
